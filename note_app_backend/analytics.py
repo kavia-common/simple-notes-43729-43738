@@ -2,8 +2,8 @@
 NoteApp Analytics Module
 =======================
 
-This module provides small, dependency-free analytics helpers that can be used by the
-NoteApp backend (FastAPI) to compute lightweight metrics such as:
+This module provides small analytics helpers that can be used by the NoteApp backend
+(FastAPI) to compute lightweight metrics such as:
 
 - Counts (e.g., number of notes created)
 - Rates (e.g., requests per minute)
@@ -12,16 +12,26 @@ NoteApp backend (FastAPI) to compute lightweight metrics such as:
 Why this exists
 ---------------
 The repository is currently early-stage and may not yet include full application code.
-This module is intentionally standalone, pure-Python, and well-documented so that:
+This module is intentionally standalone, pure-Python where possible, and well-documented
+so that:
 
 1) Documentation tooling can discover it and generate API docs from docstrings.
-2) Future backend code can import and use it without additional dependencies.
+2) Future backend code can import and use it.
 
 Design principles
 -----------------
 - No I/O: functions/classes here do not read/write files or perform network calls.
-- No external dependencies: only Python standard library.
 - Predictable behavior: inputs are validated and errors are explicit.
+- Optional analytics dependency: some helpers can optionally use NumPy when installed.
+
+Dependency note (NumPy)
+-----------------------
+This repository now includes an *analytics dependency* (`numpy`) to support simple
+numerical calculations and serve as a discoverable example of analytics usage.
+
+NumPy usage is intentionally optional at runtime:
+- If NumPy is available, `compute_average_note_length_numpy(...)` uses it.
+- If NumPy is not installed, it raises a clear ImportError with install guidance.
 
 Typical usage
 -------------
@@ -53,6 +63,11 @@ If you have a collection of note-like dictionaries, you can summarize them:
     ... ]
     >>> summarize_notes(notes)["note_count"]
     2
+
+And (optionally) compute an average using NumPy:
+
+    >>> compute_average_note_length_numpy(notes)
+    8.0
 """
 
 from __future__ import annotations
@@ -320,3 +335,64 @@ def summarize_notes(
         "average_content_chars": float(average_content_chars),
         "unique_ids": len(ids_seen),
     }
+
+
+# PUBLIC_INTERFACE
+def compute_average_note_length_numpy(
+    notes: Iterable[Mapping[str, Any]],
+    *,
+    content_key: str = "content",
+) -> float:
+    """
+    Compute the average note content length (in characters) using NumPy.
+
+    This function exists primarily to provide a *small, concrete example* of using an
+    analytics library dependency inside an analytics-related backend module.
+
+    Behavior
+    --------
+    - Extracts the note content values using `content_key`.
+    - Treats missing/None content as empty string.
+    - Uses `numpy.mean` to compute the average content length.
+
+    Parameters
+    ----------
+    notes:
+        Iterable of mapping-like objects containing note data.
+    content_key:
+        Mapping key holding the note body/content.
+
+    Returns
+    -------
+    float
+        Average content length in characters. Returns 0.0 if there are no notes.
+
+    Raises
+    ------
+    ImportError
+        If NumPy is not installed. Install it with: `pip install numpy`.
+
+    Examples
+    --------
+    >>> notes = [{"content": "Hi"}, {"content": "Hello"}]
+    >>> compute_average_note_length_numpy(notes)
+    3.5
+    """
+    try:
+        import numpy as np  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise ImportError(
+            "NumPy is required for compute_average_note_length_numpy(). "
+            "Install it with `pip install numpy`."
+        ) from exc
+
+    lengths = []
+    for note in notes:
+        raw_content = note.get(content_key)
+        content = "" if raw_content is None else str(raw_content)
+        lengths.append(len(content))
+
+    if not lengths:
+        return 0.0
+
+    return float(np.mean(np.array(lengths, dtype=float)))
