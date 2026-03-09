@@ -80,34 +80,45 @@ from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional
 @dataclass
 class AnalyticsTracker:
     """
-    An in-memory analytics counter tracker.
+    In-memory analytics counter tracker (process-local).
 
-    This class is intended to be embedded in higher-level services (e.g., FastAPI route
-    handlers, service layer classes) to track simple counters such as:
+    This class stores named integer counters in a mutable mapping and is intended for
+    *lightweight instrumentation* inside a backend (for example, FastAPI route handlers
+    or a service layer).
 
-    - number of notes created
-    - number of notes deleted
-    - number of validation errors
+    Typical counters include:
+    - number of notes created / deleted
     - number of requests per endpoint
+    - number of validation errors
+    - any other discrete event counts you want to observe during runtime
 
-    Important notes
-    ---------------
-    - This is *not* persistent storage. If the process restarts, counters reset.
-    - This is *not* multi-process or multi-node safe. For production analytics, a shared
-      store (Redis, Postgres, Prometheus, etc.) would be needed.
-    - This class is still useful for:
-        * local development
-        * tests
-        * simple runtime diagnostics
-        * documentation examples
+    Important limitations
+    ---------------------
+    - **Not persistent**: counters reset when the Python process restarts.
+    - **Not multi-process safe**: if you run multiple workers (e.g., gunicorn/uvicorn
+      workers), each worker has its own tracker instance/state.
+    - **Not a metrics backend**: for production-grade analytics, use a shared store or a
+      metrics system (Redis/Postgres/Prometheus/OpenTelemetry, etc.).
 
     Attributes
     ----------
     namespace:
-        A logical grouping label. It is not used in calculations but can help identify
-        the counters if multiple trackers exist.
+        Logical grouping label for the tracker. This module does not interpret the value,
+        but it can be helpful when logging or when multiple trackers exist.
     counters:
-        A mutable mapping of counter name to integer value.
+        Mutable mapping of counter name to integer value.
+
+    Examples
+    --------
+    >>> tracker = AnalyticsTracker(namespace="notes")
+    >>> tracker.increment("create_note")
+    1
+    >>> tracker.increment("create_note", by=2)
+    3
+    >>> tracker.get("create_note")
+    3
+    >>> tracker.snapshot()
+    {'create_note': 3}
     """
 
     namespace: str = "default"
@@ -115,24 +126,29 @@ class AnalyticsTracker:
 
     def increment(self, key: str, by: int = 1) -> int:
         """
-        Increment a named counter and return the new value.
+        Increment a named counter and return the updated value.
 
         Parameters
         ----------
         key:
-            Counter name (e.g., "create_note", "delete_note", "notes_list").
+            Counter name (for example: ``"create_note"``, ``"delete_note"``,
+            ``"notes_list"``). Must be a non-empty string.
         by:
-            Amount to increment by. Must be a positive integer.
+            Amount to increment by. Must be a positive integer (>= 1).
 
         Returns
         -------
         int
-            The updated counter value.
+            The updated counter value after incrementing.
 
         Raises
         ------
         ValueError
-            If `key` is empty or `by` is not a positive integer.
+            If ``key`` is empty/blank, or if ``by`` is not a positive integer.
+
+        Notes
+        -----
+        This method mutates the internal ``counters`` mapping.
         """
         if not isinstance(key, str) or not key.strip():
             raise ValueError("key must be a non-empty string")
@@ -150,19 +166,19 @@ class AnalyticsTracker:
         Parameters
         ----------
         key:
-            Counter name to retrieve.
+            Counter name to retrieve. Must be a non-empty string.
         default:
             Value to return if the counter does not exist.
 
         Returns
         -------
         int
-            The counter value (or `default` if missing).
+            Current counter value (or ``default`` if missing).
 
         Raises
         ------
         ValueError
-            If `key` is empty.
+            If ``key`` is empty/blank.
         """
         if not isinstance(key, str) or not key.strip():
             raise ValueError("key must be a non-empty string")
@@ -175,14 +191,17 @@ class AnalyticsTracker:
         Returns
         -------
         dict[str, int]
-            A shallow copy of the internal counter mapping.
+            A shallow copy of the internal counter mapping (safe to modify by callers).
 
-        Notes
+        Usage
         -----
-        A snapshot is useful for:
-        - debugging
-        - returning metrics in a health/diagnostics endpoint
-        - logging a stable view of counters at a moment in time
+        This is useful for diagnostics endpoints, logs, or quick debugging:
+
+        >>> tracker = AnalyticsTracker()
+        >>> tracker.increment("x")
+        1
+        >>> tracker.snapshot()
+        {'x': 1}
         """
         return dict(self.counters)
 
@@ -195,47 +214,67 @@ def compute_event_rate_per_minute(
     window_seconds: int = 60,
 ) -> float:
     """
-    Compute an event rate (events per minute) over a trailing time window.
+    Compute an event rate in **events per minute** over a trailing time window.
 
-    This function is commonly useful for simple operational analytics, such as:
-    - "requests per minute"
-    - "note creations per minute"
+    This is a small utility for operational-style analytics such as:
+    - requests per minute
+    - note creations per minute
+    - background job executions per minute
 
-    The rate is computed as:
+    The function counts how many timestamps fall within the trailing window:
+
+    - Window end: ``now`` (defaults to current UTC time)
+    - Window start: ``now - window_seconds``
+
+    Then computes::
 
         rate_per_minute = (events_in_window / window_seconds) * 60
 
     Parameters
     ----------
     event_timestamps:
-        An iterable of `datetime` objects representing when events occurred.
-        Timestamps may be timezone-aware or naive; however, mixing naive and aware
-        datetimes is not supported and will raise an error (Python's default behavior).
+        Iterable of :class:`datetime.datetime` values representing when events occurred.
+        The iterable is consumed once.
+
+        Timezone guidance:
+        - You may pass timezone-aware or naive datetimes.
+        - **Do not mix** naive and timezone-aware datetimes across ``event_timestamps``
+          and ``now``; Python will raise when comparing/operating on mixed types in many
+          contexts.
     now:
-        The reference time used as "current time" for the trailing window.
-        If omitted, uses `datetime.now(timezone.utc)` (timezone-aware).
-        Tip: passing `now` is helpful for deterministic tests.
+        Reference time considered as "current time" for the trailing window. If omitted,
+        uses ``datetime.now(timezone.utc)``.
+
+        Passing an explicit value is recommended in tests to make results deterministic.
     window_seconds:
         Size of the trailing window in seconds. Must be a positive integer.
-        Example: `window_seconds=300` computes a 5-minute trailing window.
 
     Returns
     -------
     float
-        The computed rate in events per minute. Returns 0.0 if there are no events.
+        The computed rate as events per minute. Returns ``0.0`` when the input contains
+        no events within the window (including the case where ``event_timestamps`` is
+        empty).
 
     Raises
     ------
     ValueError
-        If `window_seconds` is not a positive integer.
+        If ``window_seconds`` is not a positive integer.
 
     Examples
     --------
+    Deterministic computation (recommended for tests):
+
     >>> from datetime import datetime, timedelta, timezone
     >>> base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     >>> events = [base - timedelta(seconds=59), base - timedelta(seconds=1)]
     >>> compute_event_rate_per_minute(events, now=base, window_seconds=60)
     2.0
+
+    Empty input yields 0.0:
+
+    >>> compute_event_rate_per_minute([], now=base, window_seconds=60)
+    0.0
     """
     if not isinstance(window_seconds, int) or window_seconds <= 0:
         raise ValueError("window_seconds must be a positive integer")
@@ -244,10 +283,12 @@ def compute_event_rate_per_minute(
     window_start = effective_now.timestamp() - window_seconds
 
     count = 0
+    effective_now_ts = effective_now.timestamp()
     for ts in event_timestamps:
         # If datetime is naive, timestamp() interprets in local time.
         # We intentionally do not coerce; callers should supply consistent timestamps.
-        if ts.timestamp() >= window_start and ts.timestamp() <= effective_now.timestamp():
+        ts_value = ts.timestamp()
+        if window_start <= ts_value <= effective_now_ts:
             count += 1
 
     return (count / window_seconds) * 60.0
@@ -262,46 +303,74 @@ def summarize_notes(
     id_key: str = "id",
 ) -> Dict[str, Any]:
     """
-    Summarize a collection of note-like objects.
+    Summarize a collection of note-like mappings into simple aggregate metrics.
 
-    This is a general utility that expects an iterable of mappings (e.g., dictionaries)
-    and computes basic summary metrics that are commonly useful for UI and operational
-    analytics.
+    This function is intentionally *schema-light*: it expects an iterable of mapping-like
+    objects (most commonly dictionaries) and extracts ``id``, ``title``, and ``content``
+    fields using the configured keys.
+
+    It is useful for:
+    - lightweight analytics displayed in an admin/diagnostics panel
+    - generating quick summaries for tests or debugging
+    - producing derived metrics without additional dependencies
 
     Computed fields
     ---------------
-    - note_count: total number of notes
-    - notes_with_titles: number of notes where `title_key` is non-empty
-    - total_content_chars: sum of lengths of each note's content string
-    - average_content_chars: total_content_chars / note_count (0 if no notes)
-    - unique_ids: number of unique non-empty IDs found under `id_key`
+    The returned dictionary contains:
+
+    - ``note_count``:
+        Total number of notes encountered.
+    - ``notes_with_titles``:
+        Count of notes whose title (``title_key``) is a non-empty string after stripping.
+    - ``total_content_chars``:
+        Sum of ``len(content)`` across all notes.
+    - ``average_content_chars``:
+        Average content length as ``total_content_chars / note_count``; ``0.0`` when
+        there are no notes.
+    - ``unique_ids``:
+        Number of unique, non-empty IDs found under ``id_key``.
 
     Parameters
     ----------
     notes:
         Iterable of mapping-like objects containing note data.
-        Example item: {"id": "123", "title": "Shopping", "content": "Milk"}.
+
+        Minimal example item::
+
+            {"id": "123", "title": "Shopping", "content": "Milk"}
     content_key:
-        Mapping key holding the note body/content.
+        Key that holds the note body/content.
     title_key:
-        Mapping key holding the note title.
+        Key that holds the note title.
     id_key:
-        Mapping key holding the note identifier.
+        Key that holds the note identifier.
 
     Returns
     -------
     dict[str, Any]
-        A dictionary containing the computed summary metrics.
+        Summary metrics described above.
 
     Notes
     -----
-    - Missing keys are treated as empty strings (for title/content) or `None` (for id).
-    - Content/title values are converted to strings if present and not None.
+    - Missing keys are treated as:
+      - empty string for title/content (so they contribute 0 chars / no title)
+      - ``None`` for id (so it is ignored)
+    - Non-string values for title/content/id are coerced to strings when present.
 
     Examples
     --------
-    >>> summarize_notes([{"id": "1", "title": "A", "content": "Hi"}])["average_content_chars"]
-    2.0
+    >>> notes = [
+    ...     {"id": "n1", "title": "A", "content": "Hello"},
+    ...     {"id": "n2", "title": "", "content": "World"},
+    ...     {"id": "n2", "title": None, "content": None},
+    ... ]
+    >>> summary = summarize_notes(notes)
+    >>> summary["note_count"]
+    3
+    >>> summary["notes_with_titles"]
+    1
+    >>> summary["unique_ids"]
+    2
     """
     note_count = 0
     notes_with_titles = 0
@@ -344,39 +413,45 @@ def compute_average_note_length_numpy(
     content_key: str = "content",
 ) -> float:
     """
-    Compute the average note content length (in characters) using NumPy.
+    Compute average note content length (characters) using NumPy.
 
-    This function exists primarily to provide a *small, concrete example* of using an
-    analytics library dependency inside an analytics-related backend module.
+    This helper demonstrates how an analytics-oriented module may optionally rely on a
+    third-party numerical library for computation. In this repository it is primarily a
+    *documentation-friendly example* of an optional dependency.
 
     Behavior
     --------
-    - Extracts the note content values using `content_key`.
-    - Treats missing/None content as empty string.
-    - Uses `numpy.mean` to compute the average content length.
+    - Extracts each note's content using ``content_key``.
+    - Treats missing or ``None`` content as an empty string.
+    - Computes the mean of the content lengths using ``numpy.mean``.
 
     Parameters
     ----------
     notes:
         Iterable of mapping-like objects containing note data.
+        Each item is expected to support ``.get(content_key)``.
     content_key:
-        Mapping key holding the note body/content.
+        Key holding the note body/content.
 
     Returns
     -------
     float
-        Average content length in characters. Returns 0.0 if there are no notes.
+        Average content length in characters.
+
+        Returns ``0.0`` if the iterable contains no notes.
 
     Raises
     ------
     ImportError
-        If NumPy is not installed. Install it with: `pip install numpy`.
+        If NumPy is not installed in the runtime environment. Install it with::
+
+            pip install numpy
 
     Examples
     --------
-    >>> notes = [{"content": "Hi"}, {"content": "Hello"}]
+    >>> notes = [{"content": "Hi"}, {"content": "Hello"}, {"content": None}]
     >>> compute_average_note_length_numpy(notes)
-    3.5
+    2.3333333333333335
     """
     try:
         import numpy as np  # type: ignore
